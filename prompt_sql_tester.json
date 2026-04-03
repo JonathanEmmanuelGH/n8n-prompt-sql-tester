@@ -1,0 +1,483 @@
+{
+  "name": "Prompt SQL Tester — Teradata MCP",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {
+          "allowFileUploads": true
+        }
+      },
+      "id": "b4e752ab-f035-4001-973a-66f5735c1972",
+      "name": "1 · Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        7312,
+        2768
+      ],
+      "webhookId": "YOUR_WEBHOOK_ID"
+    },
+    {
+      "parameters": {
+        "jsCode": "const inputItem = $input.first();\nconst output    = inputItem.json.output || inputItem.json.text || '';\n// ── Parse JSON from agent output ────────────────────────────────────────────\nlet parsed = null;\nconst fence = output.match(/```json\\s*([\\s\\S]*?)```/);\nif (fence) { try { parsed = JSON.parse(fence[1].trim()); } catch(e) {} }\nif (!parsed) { const b = output.match(/\\{[\\s\\S]+\\}/); if (b) { try { parsed = JSON.parse(b[0]); } catch(e) {} } }\nif (!parsed) { try { parsed = JSON.parse(output.trim()); } catch(e) {} }\nfunction clean(v) {\n if (!v) return '';\n const s = String(v).trim();\n return (s === 'null' || s === 'undefined' || s === 'skip') ? '' : s;\n}\nconst ready         = parsed !== null && parsed.ready === true;\nconst promptName    = clean(parsed?.prompt_name);\nconst testQuestion  = clean(parsed?.test_question);\nconst expectedTable = clean(parsed?.expected_table).toUpperCase();\nconst rawCols       = clean(parsed?.expected_columns);\nconst expectedCols  = rawCols ? rawCols.split(',').map(c => c.trim().toUpperCase()).filter(Boolean) : [];\nconst variants      = Array.isArray(parsed?.variants) ? parsed.variants : [];\nconst intakeTokens  = parsed?.input_tokens || 0;\nif (!ready || !promptName) {\n return [{ json: { ready: false, agent_message: output } }];\n}\n// ── Get YAML from static data ────────────────────────────────────────────────\nconst sd = $getWorkflowStaticData('global');\nlet yamlContent = inputItem.json.yaml_content || sd['yaml_content'] || '';\nyamlContent = yamlContent.replace(/\\\\n/g, '\\n').replace(/\\\\t/g, '\\t');\nif (!yamlContent) {\n throw new Error('yaml_content is empty. Make sure Node 1 ran successfully this session.');\n}\n// ── Extract prompt_content — this becomes the system prompt for Node 7 ───────\nfunction extractPromptContent(yaml, name) {\n const lines      = yaml.split('\\n');\n let foundEntry   = false;\n let inContent    = false;\n let baseIndent   = -1;\n const result     = [];\n for (let i = 0; i < lines.length; i++) {\n   const line = lines[i];\n   const nameMatch = line.match(/^\\s*-?\\s*prompt_name\\s*:\\s*(.+)$/);\n   if (nameMatch) {\n     const entryName = nameMatch[1].trim().replace(/^[\"']|[\"']$/g, '');\n     if (foundEntry && inContent && result.length > 0) {\n       return result.join('\\n').trim();\n     }\n     foundEntry    = (entryName === name);\n     inContent     = false;\n     baseIndent    = -1;\n     result.length = 0;\n     continue;\n   }\n   if (!foundEntry) continue;\n   const contentBlockMatch  = line.match(/^(\\s*)prompt_content\\s*:\\s*[|>][-+]?\\s*$/);\n   const contentInlineMatch = line.match(/^(\\s*)prompt_content\\s*:\\s*(\\S.+)$/);\n   if (contentBlockMatch)  { inContent = true; baseIndent = -1; continue; }\n   if (contentInlineMatch) { return contentInlineMatch[2].trim().replace(/^[\"']|[\"']$/g, ''); }\n   if (!inContent) continue;\n   const lineIndent = line.match(/^(\\s*)/)[1].length;\n   if (baseIndent === -1) {\n     if (line.trim() === '') continue;\n     baseIndent = lineIndent;\n   }\n   if (line.trim() !== '' && lineIndent < baseIndent) break;\n   result.push(line.length >= baseIndent ? line.slice(baseIndent) : line.trim());\n }\n if (foundEntry && inContent && result.length > 0) return result.join('\\n').trim();\n return null;\n}\nconst systemPrompt = extractPromptContent(yamlContent, promptName);\nif (!systemPrompt) {\n const foundNames = yamlContent.split('\\n')\n   .map(l => { const m = l.match(/^\\s*-?\\s*prompt_name\\s*:\\s*(.+)$/); return m ? m[1].trim().replace(/^[\"']|[\"']$/g,'') : null; })\n   .filter(Boolean);\n throw new Error(`Prompt \"${promptName}\" not found. Names found: [${foundNames.join(', ')}]`);\n}\n// ── Build output items ───────────────────────────────────────────────────────\n// NOTE: yaml_content is intentionally excluded from output.\n// Node 7 only needs system_prompt (the extracted prompt_content) and the\n// variant_question as user message. Passing the full YAML downstream\n// would blow the model's context window.\nsd['current_test_results'] = [];\nsd['current_test_context']  = null;\nconst runId = 'run_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);\nconst base = {\n run_id:           runId,\n submitted_at:     new Date().toISOString(),\n prompt_name:      promptName,\n test_question:    testQuestion,\n expected_table:   expectedTable,\n expected_columns: expectedCols,\n system_prompt:    systemPrompt,   // ← full prompt_content from YAML, used as Node 7 system prompt\n intake_tokens:    intakeTokens\n // yaml_content deliberately not included — stored in static data only\n};\nsd['current_test_context'] = base;\nconst finalVariants = variants.length === 3\n ? variants\n : [testQuestion, testQuestion, testQuestion];\nreturn finalVariants.map((q, i) => ({\n json: {\n   ...base,\n   variant_index:    i + 1,\n   variant_question: q       // ← this is the user prompt for Node 7\n }\n}));"
+      },
+      "id": "ac2a982b-26a1-4d9a-889e-d7d412c66b88",
+      "name": "3 · Parse + Lookup + Emit Variants",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7920,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ \n'🏁 Test complete!\\n\\n' +\n'Prompt:   ' + $json.prompt_name + '\\n' +\n'Question: ' + $json.seed_question + '\\n\\n' +\n'━━━━━━━━━━━━━━━━━━━━━━━━\\n' +\n'Verdict:      ' + ($json.final_verdict === 'PASS' ? '✅ PASS' : $json.final_verdict === 'WARN' ? '⚠️ WARN' : '❌ FAIL') + '\\n' +\n'Consistency:  ' + $json.consistency_score + ' (' + $json.consistency_verdict + ')\\n' +\n'Syntax OK:    ' + $json.syntax_all_passed + '\\n' +\n'Table Check:  ' + $json.table_check + '\\n' +\n'Tokens:       ' + $json.total_tokens + ' (in: ' + $json.total_input_tokens + ' / out: ' + $json.total_output_tokens + ')\\n' +\n($json.syntax_violations !== '—' ? 'Violations:   ' + $json.syntax_violations + '\\n' : '') +\n'━━━━━━━━━━━━━━━━━━━━━━━━\\n' +\n'▶ V1: ' + $json.variant_1_question + '\\n' +\n'  SQL: ' + $json.variant_1_sql + '\\n' +\n'  Result: ' + $json.variant_1_mcp_answer + '\\n' +\n'  Syntax: ' + $json.variant_1_syntax + ($json.variant_1_violations !== '—' ? ' | ' + $json.variant_1_violations : '') + '\\n\\n' +\n'▶ V2: ' + $json.variant_2_question + '\\n' +\n'  SQL: ' + $json.variant_2_sql + '\\n' +\n'  Result: ' + $json.variant_2_mcp_answer + '\\n' +\n'  Syntax: ' + $json.variant_2_syntax + ($json.variant_2_violations !== '—' ? ' | ' + $json.variant_2_violations : '') + '\\n\\n' +\n'▶ V3: ' + $json.variant_3_question + '\\n' +\n'  SQL: ' + $json.variant_3_sql + '\\n' +\n'  Result: ' + $json.variant_3_mcp_answer + '\\n' +\n'  Syntax: ' + $json.variant_3_syntax + ($json.variant_3_violations !== '—' ? ' | ' + $json.variant_3_violations : '') + '\\n\\n' +\n'━━━━━━━━━━━━━━━━━━━━━━━━\\n' +\n'Run ID: ' + $json.run_id + '\\n\\nWant to test another? Just type it!'\n}}",
+        "options": {}
+      },
+      "id": "4b51fd7c-4e3f-44ef-9065-088e86807dff",
+      "name": "10 · Chat Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        9136,
+        2560
+      ]
+    },
+    {
+      "parameters": {
+        "modelSource": "inferenceProfile",
+        "model": "global.anthropic.claude-sonnet-4-20250514-v1:0",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1.1,
+      "position": [
+        7600,
+        2976
+      ],
+      "id": "42198a64-3668-418f-a2f5-deea9404aa78",
+      "name": "AWS Bedrock — Intake"
+    },
+    {
+      "parameters": {
+        "modelSource": "inferenceProfile",
+        "model": "global.anthropic.claude-sonnet-4-20250514-v1:0",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1.1,
+      "position": [
+        8288,
+        3024
+      ],
+      "id": "d8357b85-158c-4bc6-b5ba-b397d94c2384",
+      "name": "AWS Bedrock — SQL"
+    },
+    {
+      "parameters": {
+        "endpointUrl": "https://YOUR_MCP_ENDPOINT",
+        "authentication": "headerAuth",
+        "include": "selected",
+        "includeTools": [
+          "base_columnDescription"
+        ],
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.2,
+      "position": [
+        8448,
+        3024
+      ],
+      "id": "8658ed29-5e7e-4443-b58b-d718be2606d1",
+      "name": "MCP Client2"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item       = $input.first();\nconst chatInput  = item.json.chatInput || '';\nconst binaryData = item.binary;\nconst sd         = $getWorkflowStaticData('global');\nconst hasFile = binaryData && Object.keys(binaryData).length > 0;\n// ── No file attached — try to reuse previously stored YAML ──────────────────\nif (!hasFile) {\n const cachedYaml   = sd['yaml_content'];\n const cachedPrompts = sd['available_prompts'];\n if (cachedYaml && cachedPrompts && cachedPrompts.length > 0) {\n   // Reuse stored YAML silently\n   return [{ json: {\n     chatInput,\n     available_prompts: cachedPrompts,\n     file_error:        null,\n     yaml_source:       'cache'   // helpful for debugging\n   }}];\n }\n // Nothing stored yet — ask user to upload\n return [{ json: {\n   chatInput,\n   available_prompts: [],\n   file_error:        'No YAML file loaded. Please upload your YAML prompts file to begin.',\n   yaml_source:       'none'\n }}];\n}\n// ── File attached — parse and store, replacing any previous YAML ─────────────\nconst fileKey = Object.keys(binaryData)[0];\nconst b64     = binaryData[fileKey].data;\nif (!b64) {\n return [{ json: {\n   chatInput,\n   available_prompts: [],\n   file_error:        'File was attached but could not be read. Please try uploading again.',\n   yaml_source:       'none'\n }}];\n}\nconst yamlText = Buffer.from(b64, 'base64').toString('utf-8');\nconst promptNames = [];\nconst lines = yamlText.split('\\n');\nfor (const line of lines) {\n const match = line.match(/^\\s*-?\\s*prompt_name\\s*:\\s*(.+)$/);\n if (match) {\n   const name = match[1].trim().replace(/^[\"']|[\"']$/g, '');\n   if (name) promptNames.push(name);\n }\n}\nif (promptNames.length === 0) {\n return [{ json: {\n   chatInput,\n   available_prompts: [],\n   file_error:        'YAML parsed but no prompt_name fields found. Check your file structure.',\n   yaml_source:       'none'\n }}];\n}\n// Persist to static data for all future runs\nsd['yaml_content']      = yamlText;\nsd['available_prompts'] = promptNames;\nreturn [{ json: {\n chatInput,\n available_prompts: promptNames,\n file_error:        null,\n yaml_source:       'uploaded'   // so you can confirm a fresh upload was processed\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7488,
+        2768
+      ],
+      "id": "c4cf5483-1fe0-454b-be54-cdd674f1c8db",
+      "name": "yaml input"
+    },
+    {
+      "parameters": {
+        "messages": {
+          "messageValues": [
+            {
+              "message": "=You are a JSON-only assistant. No markdown, no explanation.\n{{ $json.file_error ? \"⚠️ \" + $json.file_error + \" Re-upload YAML to continue.\" : \"\" }}\nCollect BOTH:\n1. prompt_name — must match exactly one of: {{ $json.available_prompts.join(\" | \") }}\n2. test_question — the business question to test\nOnce you have both, output ONLY this JSON:\n{\"ready\":true,\"prompt_name\":\"NAME\",\"test_question\":\"QUESTION\",\"expected_table\":\"\",\"expected_columns\":\"\",\"variants\":[\"v1\",\"v2\",\"v3\"],\"input_tokens\":0}\nRules:\n- variants = 3 meaningfully different phrasings of test_question\n- input_tokens = chars/4 as integer\n- If file_error exists, do NOT output JSON\n- If missing either field, ask for it once then output JSON"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        7616,
+        2768
+      ],
+      "id": "1ae9cfb7-709d-4e08-9db1-8fd6d9cd2655",
+      "name": "2 · Intake + Paraphrase Agent1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "f7c06134-8fd7-4d4e-847a-40b833f923a9",
+      "name": "4 · Loop",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        8096,
+        2768
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $input.first().json;\n\nconst raw  = prev.output || '';\n\nfunction extractSQL(txt) {\n  const stripped = txt.replace(/```sql|```/gi, '').trim();\n  return stripped || txt.trim();\n}\n\nconst sql = extractSQL(raw).replace(/\\\\n/g, '\\n').replace(/\\\\t/g, '\\t');\nconst up  = sql.toUpperCase();\nconst violations = [];\n\nif (/\\bLIMIT\\b/.test(up))               violations.push('Uses LIMIT (use SELECT TOP)');\nif (/\\bFETCH\\b/.test(up))               violations.push('Uses FETCH (use SELECT TOP)');\nif (/\\bOFFSET\\b/.test(up))              violations.push('Uses OFFSET');\nif (/`/.test(sql))                       violations.push('Uses backticks');\nif (/\\[|\\]/.test(sql))                   violations.push('Uses square brackets');\nif (/!=/.test(sql))                      violations.push('Uses != (use <>)');\nif (/\\bISNULL\\s*\\(/.test(up))           violations.push('Uses ISNULL() (use COALESCE)');\nif (/SELECT\\s+\\*/.test(up))             violations.push('Uses SELECT *');\nif (/WHERE.*ROW_NUMBER\\s*\\(/i.test(sql)) violations.push('Filters window fn in WHERE (use QUALIFY)');\n\nconst expTable    = (prev.expected_table || '').toUpperCase();\nconst expCols     = prev.expected_columns || [];\nconst tableFound  = expTable ? up.includes(expTable) : null;\nconst missingCols = expCols.filter(c => c && !up.includes(c));\n\nif (expTable && !tableFound) violations.push('Wrong table: ' + expTable);\nif (missingCols.length > 0)  violations.push('Missing cols: ' + missingCols.join(', '));\n\n// Tokens reliably set by Node 5b\nconst inputTokens  = parseInt(prev.input_tokens  || 0, 10);\nconst outputTokens = parseInt(prev.output_tokens || 0, 10);\n\nconst result = {\n  variant_index:    prev.variant_index,\n  variant_question: prev.variant_question,\n  generated_sql:    sql,\n  syntax_passed:    violations.length === 0,\n  violation_count:  violations.length,\n  violations:       violations,\n  table_check:      tableFound === null ? 'skipped' : tableFound ? 'pass' : 'fail',\n  column_check:     missingCols.length === 0 ? 'pass' : 'fail',\n  mcp_answer:       '—',\n  input_tokens:     inputTokens,\n  output_tokens:    outputTokens\n};\n\nconst sd = $getWorkflowStaticData('global');\nif (!Array.isArray(sd['current_test_results'])) sd['current_test_results'] = [];\nsd['current_test_results'].push(result);\n\nreturn [{ json: { ...prev, latest_result: result } }];\n"
+      },
+      "id": "156d3b4e-7f37-4d56-9d3f-7d84a176f2d9",
+      "name": "6 · Validate + Accumulate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8608,
+        3008
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Generate Teradata SQL query for this business question. Do not run SQL query just provide it.  Use mcp toll for column descriptions. Only output the sql query. Business Question: {{ $json.variant_question }}",
+        "options": {
+          "systemMessage": "={{ $json.system_prompt }}"
+        }
+      },
+      "id": "332f0652-0a93-42ee-beea-ef71b3c7b700",
+      "name": "5 · SQL + Judge Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        8288,
+        2832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Token estimation for agent node output\n// Agent nodes don't expose real token counts — estimate from character counts (chars/4)\nconst item = $input.first();\nconst data = item.json;\n\nfunction pickInt(v) { const n = parseInt(v, 10); return isNaN(n) ? 0 : n; }\n\n// Try real metadata first (in case future n8n version passes it through)\nconst meta = data.usageMetadata || {};\nlet inputTokens  = pickInt(meta.inputTokenCount  || meta.input_tokens  || meta.promptTokens     || 0);\nlet outputTokens = pickInt(meta.outputTokenCount || meta.output_tokens || meta.completionTokens || 0);\n\n// Fall back to character-based estimation\nif (!inputTokens) {\n  const promptChars = (\n    (data.system_prompt      || '') +\n    (data.variant_question   || '')\n  ).length;\n  inputTokens = Math.round(promptChars / 4);\n}\n\nif (!outputTokens) {\n  const outputChars = (data.output || '').length;\n  outputTokens = Math.round(outputChars / 4);\n}\n\nreturn [{\n  json: {\n    ...data,\n    input_tokens:  inputTokens,\n    output_tokens: outputTokens\n  }\n}];\n"
+      },
+      "id": "db21c35a-bd0c-4fd9-be9d-0224a7f9017d",
+      "name": "5b · Token Capture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8576,
+        2848
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd      = $getWorkflowStaticData('global');\nconst results = Array.isArray(sd['current_test_results']) ? sd['current_test_results'] : [];\nconst ctx     = sd['current_test_context'] || {};\ndelete sd['current_test_results'];\ndelete sd['current_test_context'];\n// ── Consistency check — same tables used across all 3 SQLs ──────────────────\nconst tablesUsed = results.map(r => {\n const matches = (r.generated_sql || '').match(/FROM\\s+([\\w.]+)|JOIN\\s+([\\w.]+)/gi) || [];\n return matches.map(m => m.replace(/FROM\\s+|JOIN\\s+/i, '').trim().toUpperCase()).sort().join(',');\n});\nconst allSameTables    = new Set(tablesUsed).size === 1;\nconst consistencyScore = allSameTables ? 90 : 50;\nconst consistencyVerdict = allSameTables ? 'PASS' : 'WARN';\n// ── Aggregate syntax results ─────────────────────────────────────────────────\nconst allV   = results.flatMap(v => v.violations || []);\nconst uniqV  = [...new Set(allV)];\nconst totV   = results.reduce((s, v) => s + (v.violation_count || 0), 0);\nconst synOK  = results.length > 0 && results.every(v => v.syntax_passed);\nconst tblChk = results.length > 0 && results.every(v => v.table_check === 'pass' || v.table_check === 'skipped') ? 'pass' : 'fail';\nconst colChk = results.length > 0 && results.every(v => v.column_check === 'pass') ? 'pass' : 'skipped';\nconst inTok  = results.reduce((s, v) => s + (v.input_tokens  || 0), 0) + (ctx.intake_tokens || 0);\nconst outTok = results.reduce((s, v) => s + (v.output_tokens || 0), 0);\nconst verdict =\n (!synOK || tblChk === 'fail') ? 'FAIL' :\n (consistencyVerdict === 'WARN') ? 'WARN' :\n synOK ? 'PASS' : 'WARN';\nconst v = results;\nreturn [{ json: {\n // ── Run metadata ────────────────────────────────────────────────────────\n run_id:               ctx.run_id,\n tested_at:            new Date().toISOString(),\n prompt_name:          ctx.prompt_name,\n seed_question:        ctx.test_question,\n expected_table:       ctx.expected_table   || '-',\n expected_columns:     (ctx.expected_columns || []).join(', ') || '-',\n // ── Overall verdict ─────────────────────────────────────────────────────\n final_verdict:        verdict,\n consistency_score:    consistencyScore + '/100',\n consistency_verdict:  consistencyVerdict,\n syntax_all_passed:    synOK ? '✅ Yes' : '❌ No',\n syntax_violations:    uniqV.join(' | ') || '-',\n table_check:          tblChk,\n column_check:         colChk,\n // ── Token usage ─────────────────────────────────────────────────────────``\n total_input_tokens:   inTok,\n total_output_tokens:  outTok,\n total_tokens:         inTok + outTok,\n // ── Variant 1 ───────────────────────────────────────────────────────────\n variant_1_question:   v[0]?.variant_question || '-',\n variant_1_sql:        v[0]?.generated_sql    || '-',\n variant_1_mcp_answer: v[0]?.mcp_answer       || '-',\n // ── Variant 2 ───────────────────────────────────────────────────────────\n variant_2_question:   v[1]?.variant_question || '-',\n variant_2_sql:        v[1]?.generated_sql    || '-',\n variant_2_mcp_answer: v[1]?.mcp_answer       || '-',\n // ── Variant 3 ───────────────────────────────────────────────────────────\n variant_3_question:   v[2]?.variant_question || '-',\n variant_3_sql:        v[2]?.generated_sql    || '-',\n variant_3_mcp_answer: v[2]?.mcp_answer       || '-',\n}}];"
+      },
+      "id": "40d83cce-29ad-4641-a281-f38afc90341d",
+      "name": "7 · Read + Compile + Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8240,
+        2560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd  = $getWorkflowStaticData('global');\nconst row = $input.first().json;\nif (!Array.isArray(sd['csv_rows'])) sd['csv_rows'] = [];\nsd['csv_rows'].push(row);\nconst total = sd['total_questions'] || 1;\nconst done  = sd['csv_rows'].length >= total;\nif (!done) return [];\nconst rows = sd['csv_rows'];\ndelete sd['csv_rows'];\nconst headers = [\n  'run_id','tested_at','prompt_name','seed_question',\n  'expected_table','expected_columns',\n  'final_verdict','consistency_score','consistency_verdict',\n  'syntax_all_passed','syntax_violations','table_check','column_check',\n  'total_input_tokens','total_output_tokens','total_tokens',\n  'variant_1_question','variant_1_sql','variant_1_mcp_answer',\n  'variant_2_question','variant_2_sql','variant_2_mcp_answer',\n  'variant_3_question','variant_3_sql','variant_3_mcp_answer',\n  'recommend_issues','recommend_improvements','recommend_reasoning'\n];\nfunction esc(v) {\n  if (v === null || v === undefined) return '';\n  const s = String(v).replace(/\"/g, '\"\"');\n  return '\"' + s + '\"';\n}\nconst csvLines = [headers.join(',')];\nfor (const r of rows) {\n  csvLines.push(headers.map(h => esc(r[h])).join(','));\n}\nconst csvContent = csvLines.join('\\n');\nconst base64     = Buffer.from(csvContent, 'utf-8').toString('base64');\nreturn [{\n  json: { message: `✅ Done! ${rows.length} questions tested.`, row_count: rows.length },\n  binary: {\n    data: {\n      data:          base64,\n      mimeType:      'text/csv',\n      fileName:      `sql_test_results_${new Date().toISOString().slice(0,10)}.csv`,\n      fileExtension: 'csv'\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8992,
+        2560
+      ],
+      "id": "2dc2a30b-987e-4aac-9433-7e0af77391c3",
+      "name": "8 - Output"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst sd   = $getWorkflowStaticData('global');\n\n// Store full summary so Node 7d can recover it after chainLlm swallows fields\nsd['pending_summary'] = item;\n\nconst yamlContent = (sd['yaml_content'] || '').replace(/\\\\n/g, '\\n').replace(/\\\\t/g, '\\t');\n\nfunction extractPromptContent(yaml, name) {\n  const lines = yaml.split('\\n');\n  let foundEntry = false, inContent = false, baseIndent = -1;\n  const result = [];\n  for (const line of lines) {\n    const nameMatch = line.match(/^\\s*-?\\s*prompt_name\\s*:\\s*(.+)$/);\n    if (nameMatch) {\n      const entryName = nameMatch[1].trim().replace(/^[\"']|[\"']$/g, '');\n      if (foundEntry && inContent && result.length > 0) return result.join('\\n').trim();\n      foundEntry = (entryName === name);\n      inContent = false; baseIndent = -1; result.length = 0;\n      continue;\n    }\n    if (!foundEntry) continue;\n    const blockMatch  = line.match(/^(\\s*)prompt_content\\s*:\\s*[|>][-+]?\\s*$/);\n    const inlineMatch = line.match(/^(\\s*)prompt_content\\s*:\\s*(\\S.+)$/);\n    if (blockMatch)  { inContent = true; baseIndent = -1; continue; }\n    if (inlineMatch) { return inlineMatch[2].trim().replace(/^[\"']|[\"']$/g, ''); }\n    if (!inContent) continue;\n    const lineIndent = line.match(/^(\\s*)/)[1].length;\n    if (baseIndent === -1) { if (line.trim() === '') continue; baseIndent = lineIndent; }\n    if (line.trim() !== '' && lineIndent < baseIndent) break;\n    result.push(line.length >= baseIndent ? line.slice(baseIndent) : line.trim());\n  }\n  if (foundEntry && inContent && result.length > 0) return result.join('\\n').trim();\n  return null;\n}\n\nconst recommendPrompt = extractPromptContent(yamlContent, 'your_prompt_improver_name');\nif (!recommendPrompt) {\n  throw new Error('Prompt \"your_prompt_improver_name\" not found in YAML.');\n}\n\nreturn [{ json: {\n  ...item,\n  recommend_system_prompt: recommendPrompt\n}}];"
+      },
+      "id": "b4f875fc-b44b-4ccd-a0fa-20ccebb4951b",
+      "name": "7b · Extract Recommend Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8400,
+        2560
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are analyzing the following test result. Based on the verdict, SQL generated, and any violations, recommend how the original business question could be improved.\n\nPrompt tested: {{ $json.prompt_name }}\nOriginal question: {{ $json.seed_question }}\nFinal verdict: {{ $json.final_verdict }}\nConsistency score: {{ $json.consistency_score }}\nSyntax violations: {{ $json.syntax_violations }}\nTable check: {{ $json.table_check }}\n\nVariant 1 question: {{ $json.variant_1_question }}\nVariant 1 SQL: {{ $json.variant_1_sql }}\n\nVariant 2 question: {{ $json.variant_2_question }}\nVariant 2 SQL: {{ $json.variant_2_sql }}\n\nVariant 3 question: {{ $json.variant_3_question }}\nVariant 3 SQL: {{ $json.variant_3_sql }}\n\nOutput ONLY this JSON, no markdown, no explanation:\n{\"original_question\":\"...\",\"verdict\":\"...\",\"issues_identified\":[\"issue1\",\"issue2\"],\"recommended_improvements\":[\"improved question 1\",\"improved question 2\"],\"reasoning\":\"one sentence\"}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "={{ $json.recommend_system_prompt }}"
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "5baaa89f-d89c-4d1d-ac0d-582367c04d6f",
+      "name": "7c · Question Recommend Agent",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        8544,
+        2560
+      ]
+    },
+    {
+      "parameters": {
+        "modelSource": "inferenceProfile",
+        "model": "global.anthropic.claude-sonnet-4-20250514-v1:0",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAwsBedrock",
+      "typeVersion": 1.1,
+      "position": [
+        8544,
+        2688
+      ],
+      "id": "0f233df8-cb9c-4578-8810-042760da0ebf",
+      "name": "AWS Bedrock — Recommend"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst raw  = item.text || item.output || '';\n\nlet rec = null;\ntry {\n  const fence = raw.match(/```json\\s*([\\s\\S]*?)```/);\n  if (fence) rec = JSON.parse(fence[1].trim());\n  else {\n    const block = raw.match(/\\{[\\s\\S]+\\}/);\n    if (block) rec = JSON.parse(block[0]);\n  }\n} catch(e) { rec = null; }\n\n// chainLlm loses upstream fields — recover the full summary from static data\nconst sd      = $getWorkflowStaticData('global');\nconst summary = sd['pending_summary'] || {};\ndelete sd['pending_summary'];\n\nreturn [{ json: {\n  ...summary,\n  recommend_issues:       rec?.issues_identified?.join(' | ')        || '-',\n  recommend_improvements: rec?.recommended_improvements?.join(' | ') || '-',\n  recommend_reasoning:    rec?.reasoning                              || '-'\n}}];"
+      },
+      "id": "5a95d210-762b-4203-a915-fcdf0bd134ec",
+      "name": "7d · Attach Recommendation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8816,
+        2560
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "1 · Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "yaml input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3 · Parse + Lookup + Emit Variants": {
+      "main": [
+        [
+          {
+            "node": "4 · Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS Bedrock — Intake": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "2 · Intake + Paraphrase Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS Bedrock — SQL": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "5 · SQL + Judge Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP Client2": {
+      "ai_tool": [
+        [
+          {
+            "node": "5 · SQL + Judge Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "yaml input": {
+      "main": [
+        [
+          {
+            "node": "2 · Intake + Paraphrase Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2 · Intake + Paraphrase Agent1": {
+      "main": [
+        [
+          {
+            "node": "3 · Parse + Lookup + Emit Variants",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4 · Loop": {
+      "main": [
+        [
+          {
+            "node": "7 · Read + Compile + Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "5 · SQL + Judge Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "6 · Validate + Accumulate": {
+      "main": [
+        [
+          {
+            "node": "4 · Loop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5 · SQL + Judge Agent": {
+      "main": [
+        [
+          {
+            "node": "5b · Token Capture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "5b · Token Capture": {
+      "main": [
+        [
+          {
+            "node": "6 · Validate + Accumulate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7 · Read + Compile + Summary": {
+      "main": [
+        [
+          {
+            "node": "7b · Extract Recommend Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "8 - Output": {
+      "main": [
+        [
+          {
+            "node": "10 · Chat Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7b · Extract Recommend Prompt": {
+      "main": [
+        [
+          {
+            "node": "7c · Question Recommend Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7c · Question Recommend Agent": {
+      "main": [
+        [
+          {
+            "node": "7d · Attach Recommendation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "7d · Attach Recommendation": {
+      "main": [
+        [
+          {
+            "node": "8 - Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AWS Bedrock — Recommend": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "7c · Question Recommend Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
